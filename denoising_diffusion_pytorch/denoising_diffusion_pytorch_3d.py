@@ -94,7 +94,7 @@ def Upsample(dim, dim_out = None):
 def Downsample(dim, dim_out = None):
     return nn.Sequential(
         Rearrange('b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w', p1 = 2, p2 = 2, p3 = 2),
-        nn.Conv3d(dim * 4, default(dim_out, dim), 1)
+        nn.Conv3d(dim * (2**3), default(dim_out, dim), 1)
     )
 
 class WeightStandardizedConv3d(nn.Conv3d):
@@ -196,7 +196,7 @@ class ResnetBlock(nn.Module):
 
         self.block1 = Block(dim, dim_out, groups = groups)
         self.block2 = Block(dim_out, dim_out, groups = groups)
-        self.res_conv = nn.Convd(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb = None):
 
@@ -221,8 +221,8 @@ class LinearAttention(nn.Module):
         self.to_qkv = nn.Conv3d(dim, hidden_dim * 3, 1, bias = False)
 
         self.to_out = nn.Sequential(
-            LayerNorm(dim)
             nn.Conv3d(hidden_dim, dim, 1),
+            LayerNorm(dim)
         )
 
     def forward(self, x):
@@ -275,7 +275,7 @@ class Unet3D(nn.Module):
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
-        channels = 3,
+        channels = 1,
         self_condition = False,
         resnet_block_groups = 8,
         learned_variance = False,
@@ -458,7 +458,7 @@ class GaussianDiffusion3D(nn.Module):
         min_snr_gamma = 5
     ):
         super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
+        assert not (type(self) == GaussianDiffusion3D and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
@@ -801,7 +801,7 @@ def transform_nii(img, size=(64, 64, 64)):
 	img = np.expand_dims(img, axis=0)
 	return img
 
-class Dataset(Dataset):
+class Dataset3D(Dataset):
     def __init__(
         self,
         folder,
@@ -812,7 +812,7 @@ class Dataset(Dataset):
     ):
         super().__init__()
         self.folder = folder
-        self.image_size = image_size
+        self.image_size = (image_size,)*3 if isinstance(image_size, int) else image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
 
         # maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
@@ -833,13 +833,13 @@ class Dataset(Dataset):
         # img = Image.open(path)
         # return self.transform(img)
         img  = load_nii(path)
-        img  = transform_nii(img)
+        img  = transform_nii(img, self.image_size)
         return img
 
 
 # trainer class
 
-class Trainer(object):
+class Trainer3D(object):
     def __init__(
         self,
         diffusion_model,
@@ -903,7 +903,7 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.ds = Dataset3D(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)

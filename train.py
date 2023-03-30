@@ -19,7 +19,7 @@ def main():
 		diffusion,
 		'C:/devel/mri-anomaly/data/normal',
 		#train_batch_size = 32,
-		train_batch_size = 1,
+		train_batch_size = 2,
 		train_lr = 8e-5,
 		#train_num_steps = 700000,         # total training steps
 		train_num_steps = 2,              # total training steps
