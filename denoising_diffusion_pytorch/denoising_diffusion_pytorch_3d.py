@@ -694,7 +694,7 @@ class GaussianDiffusion3D(nn.Module):
     def sample(self, batch_size = 16, return_all_timesteps = False):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, image_size, image_size, image_size), return_all_timesteps = return_all_timesteps)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -798,7 +798,9 @@ def save_nii(file_name, img):
 
 def transform_nii(img, size=(64, 64, 64)):
 	img = resize(img, size, anti_aliasing=True)
+	img = img / img.max()
 	img = np.expand_dims(img, axis=0)
+	img = torch.FloatTensor(img)
 	return img
 
 class Dataset3D(Dataset):
@@ -1036,6 +1038,8 @@ class Trainer3D(object):
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+                        all_images_list = [ img[..., img.shape[-1] // 2] for img in all_images_list ]
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
