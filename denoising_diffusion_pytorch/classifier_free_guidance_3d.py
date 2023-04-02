@@ -1,19 +1,20 @@
 import math
-import copy
-from pathlib import Path
-from random import random
 from functools import partial
 from collections import namedtuple
-from multiprocessing import cpu_count
 
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 
+from torch.optim import Adam
+
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
 from tqdm.auto import tqdm
+
+import pytorch_lightning as pl
+
 
 # constants
 
@@ -105,7 +106,6 @@ class WeightStandardizedConv3d(nn.Conv3d):
         mean = reduce(weight, 'o ... -> o 1 1 1 1', 'mean')
         var = reduce(weight, 'o ... -> o 1 1 1 1', partial(torch.var, unbiased = False))
         normalized_weight = (weight - mean) * (var + eps).rsqrt()
-
         return F.conv3d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 class LayerNorm(nn.Module):
@@ -281,6 +281,7 @@ class Unet3D(nn.Module):
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
+        conditions_dim = None,
     ):
         super().__init__()
 
@@ -303,7 +304,7 @@ class Unet3D(nn.Module):
 
         # time embeddings
 
-        time_dim = dim * 4
+        time_dim = dim * 4 # should it be dim * (2**3) ?
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
@@ -323,16 +324,25 @@ class Unet3D(nn.Module):
 
         # class embeddings
 
-        self.classes_emb = nn.Embedding(num_classes, dim)
-        self.null_classes_emb = nn.Parameter(torch.randn(dim))
+        classes_dim = conditions_dim
 
-        classes_dim = dim * 4
+        self.classes_emb = None
+        self.null_classes_emb = None
 
-        self.classes_mlp = nn.Sequential(
-            nn.Linear(dim, classes_dim),
-            nn.GELU(),
-            nn.Linear(classes_dim, classes_dim)
-        )
+        if isinstance(num_classes, int):
+            self.classes_emb = nn.Embedding(num_classes, dim)
+            self.null_classes_emb = nn.Parameter(torch.randn(dim))
+
+            classes_dim = dim * 4 # should it be dim * (2**3) ?
+
+            self.classes_mlp = nn.Sequential(
+                nn.Linear(dim, classes_dim),
+                nn.GELU(),
+                nn.Linear(classes_dim, classes_dim)
+            )
+        else:
+            assert callable(num_classes)
+            self.classes_mlp = num_classes
 
         # layers
 
@@ -368,7 +378,7 @@ class Unet3D(nn.Module):
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
+        self.final_res_block = block_klass(init_dim * 2, dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
         self.final_conv = nn.Conv3d(dim, self.out_dim, 1)
 
     def forward_with_cond_scale(
@@ -396,19 +406,22 @@ class Unet3D(nn.Module):
 
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
 
-        # derive condition, with condition dropout for classifier free guidance        
+        # derive condition, with condition dropout for classifier free guidance
 
-        classes_emb = self.classes_emb(classes)
+        classes_emb = classes
 
-        if cond_drop_prob > 0:
-            keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
-            null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
+        if exists(self.classes_emb):
+            classes_emb = self.classes_emb(classes_emb)
 
-            classes_emb = torch.where(
-                rearrange(keep_mask, 'b -> b 1'),
-                classes_emb,
-                null_classes_emb
-            )
+            if cond_drop_prob > 0:
+                keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
+                null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
+
+                classes_emb = torch.where(
+                    rearrange(keep_mask, 'b -> b 1'),
+                    classes_emb,
+                    null_classes_emb
+                )
 
         c = self.classes_mlp(classes_emb)
 
@@ -771,41 +784,80 @@ class GaussianDiffusion3D(nn.Module):
         img = normalize_to_neg_one_to_one(img)
         return self.p_losses(img, t, *args, **kwargs)
 
-# example
 
-if __name__ == '__main__':
-    channels    = 1
-    image_size  = 64
-    num_classes = 10
-    batch_size  = 1
+def ml_get_best_device_name():
+	dname = 'cpu'
+	if torch.cuda.is_available():
+		dname = 'cuda'
+	elif torch.backends.mps.is_available():
+		dname = 'mps'
+	return dname
+
+
+def ml_get_best_device():
+	return torch.device(ml_get_best_device_name())
+
+
+def ml_seed_everything(seed):
+	return pl.seed_everything(seed)
+
+
+def train():
+    channels         = 1
+    image_size       = 64
+    dim              = 32
+    timesteps        = 10 # 1_000
+    sample_timesteps = 10
+    num_classes      = 5
+    batch_size       = 1
+    train_lr         = 1e-4
+    train_steps      = 100 # 100_000
+    seed             = 42
+
+    device = ml_get_best_device()
+
+    ml_seed_everything(seed)
 
     model = Unet3D(
-        dim = 64,
-        dim_mults = (1, 2, 4, 8),
-        num_classes = num_classes,
-        channels = channels,
+        dim            = dim,
+        dim_mults      = (1, 2, 4, 8),
+        num_classes    = num_classes,
+        channels       = channels,
         cond_drop_prob = 0.5
     )
 
     diffusion = GaussianDiffusion3D(
         model,
-        image_size = image_size,
-        #timesteps = 1000,
-        timesteps = 10,
-        objective = 'pred_x0',
-    ).cuda()
+        image_size         = image_size,
+        timesteps          = timesteps,
+        sampling_timesteps = sample_timesteps,
+        objective          = 'pred_x0',
+    ).to(device)
 
-    training_images = torch.randn(batch_size, channels, image_size, image_size, image_size).cuda() # images are normalized from 0 to 1
-    image_classes = torch.randint(0, num_classes, (training_images.shape[0],)).cuda()    # say 10 classes
+    # images are normalized from 0 to 1
+    training_images = torch.randn(batch_size, channels, image_size, image_size, image_size).to(device)
 
-    loss = diffusion(training_images, classes = image_classes)
-    loss.backward()
+    # classes
+    image_classes   = torch.randint(0, num_classes, (training_images.shape[0],)).to(device)
 
-    # do above for many steps
+    # optimizer
+    opt = Adam(diffusion.parameters(), lr=train_lr)
+
+    for _ in tqdm(range(train_steps), desc='train step'):
+        opt.zero_grad()
+        loss = diffusion(training_images, classes=image_classes)
+        loss.backward()
+        opt.step()
 
     sampled_images = diffusion.sample(
-        classes = image_classes,
-        cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+        classes    = image_classes,
+        cond_scale = 3.0  # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
     )
 
     print(sampled_images.shape) # (batch_size, channels, image_size, image_size, image_size)
+
+
+# example
+
+if __name__ == '__main__':
+    train()
