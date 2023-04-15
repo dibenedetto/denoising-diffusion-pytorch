@@ -183,22 +183,22 @@ class Block(nn.Module):
         return x
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim = None, classes_emb_dim = None, groups = 8):
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, conditions_emb_dim = None, groups = 8):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(int(time_emb_dim) + int(classes_emb_dim), dim_out * 2)
-        ) if exists(time_emb_dim) or exists(classes_emb_dim) else None
+            nn.Linear(int(time_emb_dim) + int(conditions_emb_dim), dim_out * 2)
+        ) if exists(time_emb_dim) or exists(conditions_emb_dim) else None
 
         self.block1 = Block(dim, dim_out, groups = groups)
         self.block2 = Block(dim_out, dim_out, groups = groups)
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
-    def forward(self, x, time_emb = None, class_emb = None):
+    def forward(self, x, time_emb = None, conditions_emb = None):
 
         scale_shift = None
-        if exists(self.mlp) and (exists(time_emb) or exists(class_emb)):
-            cond_emb = tuple(filter(exists, (time_emb, class_emb)))
+        if exists(self.mlp) and (exists(time_emb) or exists(conditions_emb)):
+            cond_emb = tuple(filter(exists, (time_emb, conditions_emb)))
             cond_emb = torch.cat(cond_emb, dim = -1)
             cond_emb = self.mlp(cond_emb)
             cond_emb = rearrange(cond_emb, 'b c -> b c 1 1 1')
@@ -270,8 +270,10 @@ class Unet3D(nn.Module):
     def __init__(
         self,
         dim,
-        num_classes,
+        num_classes = 10,
         cond_drop_prob = 0.5,
+        conditions_mlp = None,
+        conditions_dim = None,
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
@@ -281,7 +283,6 @@ class Unet3D(nn.Module):
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
         learned_sinusoidal_dim = 16,
-        conditions_dim = None,
     ):
         super().__init__()
 
@@ -322,27 +323,26 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        # class embeddings
+        # condition embeddings
 
-        classes_dim = conditions_dim
-
-        self.classes_emb = None
+        self.conditions_emb   = None
         self.null_classes_emb = None
+        self.conditions_mlp   = None
 
-        if isinstance(num_classes, int):
-            self.classes_emb = nn.Embedding(num_classes, dim)
+        if conditions_mlp is not None:
+            assert callable(conditions_mlp)
+            self.conditions_mlp = conditions_mlp
+        else:
+            self.conditions_emb   = nn.Embedding(num_classes, dim)
             self.null_classes_emb = nn.Parameter(torch.randn(dim))
 
-            classes_dim = dim * 4 # should it be dim * (2**3) ?
+            conditions_dim = dim * 4 # should it be dim * (2**3) ?
 
-            self.classes_mlp = nn.Sequential(
-                nn.Linear(dim, classes_dim),
+            self.conditions_mlp = nn.Sequential(
+                nn.Linear(dim, conditions_dim),
                 nn.GELU(),
-                nn.Linear(classes_dim, classes_dim)
+                nn.Linear(conditions_dim, conditions_dim)
             )
-        else:
-            assert callable(num_classes)
-            self.classes_mlp = num_classes
 
         # layers
 
@@ -354,23 +354,23 @@ class Unet3D(nn.Module):
             is_last = ind >= (num_resolutions - 1)
 
             self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv3d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
 
             self.ups.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, classes_emb_dim = classes_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv3d(dim_out, dim_in, 3, padding = 1)
             ]))
@@ -378,7 +378,7 @@ class Unet3D(nn.Module):
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = block_klass(init_dim * 2, dim, time_emb_dim = time_dim, classes_emb_dim = classes_dim)
+        self.final_res_block = block_klass(init_dim * 2, dim, time_emb_dim = time_dim, conditions_emb_dim = conditions_dim)
         self.final_conv = nn.Conv3d(dim, self.out_dim, 1)
 
     def forward_with_cond_scale(
@@ -399,7 +399,7 @@ class Unet3D(nn.Module):
         self,
         x,
         time,
-        classes,
+        conditions,
         cond_drop_prob = None
     ):
         batch, device = x.shape[0], x.device
@@ -408,22 +408,22 @@ class Unet3D(nn.Module):
 
         # derive condition, with condition dropout for classifier free guidance
 
-        classes_emb = classes
+        conditions_emb = conditions
 
-        if exists(self.classes_emb):
-            classes_emb = self.classes_emb(classes_emb)
+        if exists(self.conditions_emb):
+            conditions_emb = self.conditions_emb(conditions_emb)
 
             if cond_drop_prob > 0:
                 keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
                 null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
 
-                classes_emb = torch.where(
+                conditions_emb = torch.where(
                     rearrange(keep_mask, 'b -> b 1'),
-                    classes_emb,
+                    conditions_emb,
                     null_classes_emb
                 )
 
-        c = self.classes_mlp(classes_emb)
+        c = self.conditions_mlp(conditions_emb)
 
         # unet
 
@@ -619,8 +619,8 @@ class GaussianDiffusion3D(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, classes, cond_scale = 3., clip_x_start = False):
-        model_output = self.model.forward_with_cond_scale(x, t, classes, cond_scale = cond_scale)
+    def model_predictions(self, x, t, conditions, cond_scale = 3., clip_x_start = False):
+        model_output = self.model.forward_with_cond_scale(x, t, conditions, cond_scale = cond_scale)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -641,8 +641,8 @@ class GaussianDiffusion3D(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, classes, cond_scale, clip_denoised = True):
-        preds = self.model_predictions(x, t, classes, cond_scale)
+    def p_mean_variance(self, x, t, conditions, cond_scale, clip_denoised = True):
+        preds = self.model_predictions(x, t, conditions, cond_scale)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -652,16 +652,16 @@ class GaussianDiffusion3D(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, classes, cond_scale = 3., clip_denoised = True):
+    def p_sample(self, x, t: int, conditions, cond_scale = 3., clip_denoised = True):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((x.shape[0],), t, device = x.device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, classes = classes, cond_scale = cond_scale, clip_denoised = clip_denoised)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, conditions = conditions, cond_scale = cond_scale, clip_denoised = clip_denoised)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, classes, shape, cond_scale = 3.):
+    def p_sample_loop(self, conditions, shape, cond_scale = 3.):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
@@ -669,13 +669,13 @@ class GaussianDiffusion3D(nn.Module):
         x_start = None
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            img, x_start = self.p_sample(img, t, classes, cond_scale)
+            img, x_start = self.p_sample(img, t, conditions, cond_scale)
 
         img = unnormalize_to_zero_to_one(img)
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, classes, shape, cond_scale = 3., clip_denoised = True):
+    def ddim_sample(self, conditions, shape, cond_scale = 3., clip_denoised = True):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -688,7 +688,7 @@ class GaussianDiffusion3D(nn.Module):
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device=device, dtype=torch.long)
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, classes, cond_scale = cond_scale, clip_x_start = clip_denoised)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, conditions, cond_scale = cond_scale, clip_x_start = clip_denoised)
 
             if time_next < 0:
                 img = x_start
@@ -710,10 +710,10 @@ class GaussianDiffusion3D(nn.Module):
         return img
 
     @torch.no_grad()
-    def sample(self, classes, cond_scale = 3.):
-        batch_size, image_size, channels = classes.shape[0], self.image_size, self.channels
+    def sample(self, conditions, cond_scale = 3.):
+        batch_size, image_size, channels = conditions.shape[0], self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn(classes, (batch_size, channels, image_size, image_size, image_size), cond_scale)
+        return sample_fn(conditions, (batch_size, channels, image_size, image_size, image_size), cond_scale)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -748,7 +748,7 @@ class GaussianDiffusion3D(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, *, classes, noise = None):
+    def p_losses(self, x_start, t, *, conditions, noise = None):
         b, c, d, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -758,7 +758,7 @@ class GaussianDiffusion3D(nn.Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, classes)
+        model_out = self.model(x, t, conditions)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -786,32 +786,33 @@ class GaussianDiffusion3D(nn.Module):
 
 
 def ml_get_best_device_name():
-	dname = 'cpu'
-	if torch.cuda.is_available():
-		dname = 'cuda'
-	elif torch.backends.mps.is_available():
-		dname = 'mps'
-	return dname
+    dname = 'cpu'
+    if torch.cuda.is_available():
+        dname = 'cuda'
+    elif torch.backends.mps.is_available():
+        dname = 'mps'
+    return dname
 
 
 def ml_get_best_device():
-	return torch.device(ml_get_best_device_name())
+    return torch.device(ml_get_best_device_name())
 
 
-def ml_seed_everything(seed):
-	return pl.seed_everything(seed)
+def ml_seed_everything(seed=42):
+    return pl.seed_everything(seed)
 
 
 def train():
     channels         = 1
     image_size       = 64
     dim              = 32
-    timesteps        = 10 # 1_000
-    sample_timesteps = 10
+    init_dim         = 16
+    timesteps        = 5 # 1_000
+    sample_timesteps = 5 # 1_000
     num_classes      = 5
     batch_size       = 1
     train_lr         = 1e-4
-    train_steps      = 100 # 100_000
+    train_steps      = 5 # 100_000
     seed             = 42
 
     device = ml_get_best_device()
@@ -820,6 +821,7 @@ def train():
 
     model = Unet3D(
         dim            = dim,
+        init_dim       = init_dim,
         dim_mults      = (1, 2, 4, 8),
         num_classes    = num_classes,
         channels       = channels,
@@ -845,12 +847,12 @@ def train():
 
     for _ in tqdm(range(train_steps), desc='train step'):
         opt.zero_grad()
-        loss = diffusion(training_images, classes=image_classes)
+        loss = diffusion(training_images, conditions=image_classes)
         loss.backward()
         opt.step()
 
     sampled_images = diffusion.sample(
-        classes    = image_classes,
+        conditions = image_classes,
         cond_scale = 3.0  # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
     )
 
