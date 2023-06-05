@@ -13,9 +13,6 @@ from einops.layers.torch import Rearrange
 
 from tqdm.auto import tqdm
 
-import pytorch_lightning as pl
-
-
 # constants
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
@@ -270,10 +267,8 @@ class Unet3D(nn.Module):
     def __init__(
         self,
         dim,
-        num_classes = 10,
-        cond_drop_prob = 0.5,
-        conditions_mlp = None,
-        conditions_dim = None,
+        conditions_mlp,
+        conditions_dim,
         init_dim = None,
         out_dim = None,
         dim_mults=(1, 2, 4, 8),
@@ -305,7 +300,7 @@ class Unet3D(nn.Module):
 
         # time embeddings
 
-        time_dim = dim * 4 # should it be dim * (2**3) ?
+        time_dim = dim * (2**3)
 
         self.random_or_learned_sinusoidal_cond = learned_sinusoidal_cond or random_fourier_features
 
@@ -325,24 +320,8 @@ class Unet3D(nn.Module):
 
         # condition embeddings
 
-        self.conditions_emb   = None
-        self.null_classes_emb = None
-        self.conditions_mlp   = None
-
-        if conditions_mlp is not None:
-            assert callable(conditions_mlp)
-            self.conditions_mlp = conditions_mlp
-        else:
-            self.conditions_emb   = nn.Embedding(num_classes, dim)
-            self.null_classes_emb = nn.Parameter(torch.randn(dim))
-
-            conditions_dim = dim * 4 # should it be dim * (2**3) ?
-
-            self.conditions_mlp = nn.Sequential(
-                nn.Linear(dim, conditions_dim),
-                nn.GELU(),
-                nn.Linear(conditions_dim, conditions_dim)
-            )
+        self.conditions_mlp = conditions_mlp
+        self.null_conditions_emb = nn.Parameter(torch.randn(conditions_dim))
 
         # layers
 
@@ -406,22 +385,19 @@ class Unet3D(nn.Module):
 
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
 
-        # derive condition, with condition dropout for classifier free guidance
+        # derive condition, with condition dropout for classifier free guidance        
 
         conditions_emb = conditions
 
-        if exists(self.conditions_emb):
-            conditions_emb = self.conditions_emb(conditions_emb)
+        if cond_drop_prob > 0:
+            keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
+            null_conditions_emb = repeat(self.null_conditions_emb, 'd -> b d', b = batch)
 
-            if cond_drop_prob > 0:
-                keep_mask = prob_mask_like((batch,), 1 - cond_drop_prob, device = device)
-                null_classes_emb = repeat(self.null_classes_emb, 'd -> b d', b = batch)
-
-                conditions_emb = torch.where(
-                    rearrange(keep_mask, 'b -> b 1'),
-                    conditions_emb,
-                    null_classes_emb
-                )
+            conditions_emb = torch.where(
+                rearrange(keep_mask, 'b -> b 1'),
+                conditions_emb,
+                null_conditions_emb
+            )
 
         c = self.conditions_mlp(conditions_emb)
 
@@ -497,7 +473,7 @@ class GaussianDiffusion3D(nn.Module):
         timesteps = 1000,
         sampling_timesteps = None,
         loss_type = 'l1',
-        objective = 'pred_noise',
+        objective = 'pred_x0',
         beta_schedule = 'cosine',
         ddim_sampling_eta = 1.,
         min_snr_loss_weight = False,
@@ -785,45 +761,18 @@ class GaussianDiffusion3D(nn.Module):
         return self.p_losses(img, t, *args, **kwargs)
 
 
-def ml_get_best_device_name():
-    dname = 'cpu'
-    if torch.cuda.is_available():
-        dname = 'cuda'
-    elif torch.backends.mps.is_available():
-        dname = 'mps'
-    return dname
-
-
-def ml_get_best_device():
-    return torch.device(ml_get_best_device_name())
-
-
-def ml_seed_everything(seed=42):
-    return pl.seed_everything(seed)
-
-
 def train():
     # https://www.youtube.com/watch?v=TbHCvAo-aGg&ab_channel=Kams1
 
-    channels         = 1
-    image_size       = 64
-    dim              = 32
-    init_dim         = 16
-    timesteps        = 100 # 1_000
-    sample_timesteps = 100 # 1_000
-    num_classes      = 5
-    batch_size       = 1
-    train_lr         = 1e-4
-    train_steps      = 100 # 100_000
-    seed             = 42
-
-    device = ml_get_best_device()
-
-    ml_seed_everything(seed)
+    channels    = 1
+    image_size  = 64
+    num_classes = 10
+    batch_size  = 1
+    train_lr    = 1e-4
+    train_steps = 100
 
     model = Unet3D(
-        dim            = dim,
-        init_dim       = init_dim,
+        dim            = 64,
         dim_mults      = (1, 2, 4, 8),
         num_classes    = num_classes,
         channels       = channels,
@@ -832,29 +781,29 @@ def train():
 
     diffusion = GaussianDiffusion3D(
         model,
-        image_size         = image_size,
-        timesteps          = timesteps,
-        sampling_timesteps = sample_timesteps,
-        objective          = 'pred_x0',
-    ).to(device)
+        image_size = image_size,
+        #timesteps  = 1000,
+        timesteps  = 10,
+        objective  = 'pred_x0',
+    ).cuda()
 
     # images are normalized from 0 to 1
-    training_images = torch.randn(batch_size, channels, image_size, image_size, image_size).to(device)
+    training_images = torch.randn(batch_size, channels, image_size, image_size, image_size).cuda()
 
     # classes
-    image_classes   = torch.randint(0, num_classes, (training_images.shape[0],)).to(device)
+    image_classes   = torch.randint(0, num_classes, (training_images.shape[0],)).cuda()
 
     # optimizer
     opt = Adam(diffusion.parameters(), lr=train_lr)
 
-    for _ in tqdm(range(train_steps), desc='train step'):
+    for t in tqdm(range(train_steps), desc='train step'):
         opt.zero_grad()
-        loss = diffusion(training_images, conditions=image_classes)
+        loss = diffusion(training_images, classes=image_classes)
         loss.backward()
         opt.step()
 
     sampled_images = diffusion.sample(
-        conditions = image_classes,
+        classes    = image_classes,
         cond_scale = 3.0  # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
     )
 
@@ -864,4 +813,38 @@ def train():
 # example
 
 if __name__ == '__main__':
-    train()
+    channels    = 1
+    image_size  = 64
+    num_classes = 10
+    batch_size  = 1
+
+    model = Unet3D(
+        dim = 64,
+        dim_mults = (1, 2, 4, 8),
+        num_classes = num_classes,
+        channels = channels,
+        cond_drop_prob = 0.5
+    )
+
+    diffusion = GaussianDiffusion3D(
+        model,
+        image_size = image_size,
+        #timesteps = 1000,
+        timesteps = 10,
+        objective = 'pred_x0',
+    ).cuda()
+
+    training_images = torch.randn(batch_size, channels, image_size, image_size, image_size).cuda() # images are normalized from 0 to 1
+    image_classes = torch.randint(0, num_classes, (training_images.shape[0],)).cuda()    # say 10 classes
+
+    loss = diffusion(training_images, classes = image_classes)
+    loss.backward()
+
+    # do above for many steps
+
+    sampled_images = diffusion.sample(
+        classes = image_classes,
+        cond_scale = 3.                # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+    )
+
+    print(sampled_images.shape) # (batch_size, channels, image_size, image_size, image_size)
