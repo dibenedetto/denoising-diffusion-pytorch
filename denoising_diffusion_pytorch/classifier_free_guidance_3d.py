@@ -742,7 +742,7 @@ class GaussianDiffusion3D(nn.Module):
         )
 
     def p_losses(self, x_start, t, *, conditions, noise = None):
-        b, c, h, w = x_start.shape
+        b, c, d, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
@@ -848,13 +848,18 @@ def train():
 
     sampled_images = diffusion.sample(
         conditions = image_classes,
-        cond_scale = 3.0  # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
+        cond_scale = 6.0  # condition scaling, anything greater than 1 strengthens the classifier free guidance. reportedly 3-8 is good empirically
     )
 
     print(sampled_images.shape) # (batch_size, channels, image_size, image_size, image_size)
 
+    # interpolation
 
-# example
+    interpolate_out = diffusion.interpolate(
+        training_images[:1],
+        training_images[:1],
+        image_classes[:1]
+    )
 
 if __name__ == '__main__':
     train()
