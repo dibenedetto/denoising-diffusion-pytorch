@@ -772,6 +772,7 @@ def ml_get_best_device():
 
 
 def ml_seed_everything(seed=42):
+    import pytorch_lightning as pl
     return pl.seed_everything(seed)
 
 
