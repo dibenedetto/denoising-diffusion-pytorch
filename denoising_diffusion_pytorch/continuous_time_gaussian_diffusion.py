@@ -3,6 +3,7 @@ import torch
 from torch import sqrt
 from torch import nn, einsum
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from torch.special import expm1
 
 from tqdm import tqdm
@@ -116,7 +117,6 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
         *,
         image_size,
         channels = 3,
-        loss_type = 'l1',
         noise_schedule = 'linear',
         num_sample_steps = 500,
         clip_sample_denoised = True,
@@ -137,8 +137,6 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
         self.image_size = image_size
 
         # continuous noise schedule related stuff
-
-        self.loss_type = loss_type
 
         if noise_schedule == 'linear':
             self.log_snr = beta_linear_log_snr
@@ -169,15 +167,6 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
     @property
     def device(self):
         return next(self.model.parameters()).device
-
-    @property
-    def loss_fn(self):
-        if self.loss_type == 'l1':
-            return F.l1_loss
-        elif self.loss_type == 'l2':
-            return F.mse_loss
-        else:
-            raise ValueError(f'invalid loss type {self.loss_type}')
 
     def p_mean_variance(self, x, time, time_next):
         # reviewer found an error in the equation in the paper (missing sigma)
@@ -245,6 +234,7 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
 
     # training related functions - noise prediction
 
+    @autocast(enabled = False)
     def q_sample(self, x_start, times, noise = None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -266,7 +256,7 @@ class ContinuousTimeGaussianDiffusion(nn.Module):
         x, log_snr = self.q_sample(x_start = x_start, times = times, noise = noise)
         model_out = self.model(x, log_snr)
 
-        losses = self.loss_fn(model_out, noise, reduction = 'none')
+        losses = F.mse_loss(model_out, noise, reduction = 'none')
         losses = reduce(losses, 'b ... -> b', 'mean')
 
         if self.min_snr_loss_weight:

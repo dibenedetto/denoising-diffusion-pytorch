@@ -32,19 +32,20 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion
 
 model = Unet(
     dim = 64,
-    dim_mults = (1, 2, 4, 8)
+    dim_mults = (1, 2, 4, 8),
+    flash_attn = True
 )
 
 diffusion = GaussianDiffusion(
     model,
     image_size = 128,
-    timesteps = 1000,   # number of steps
-    loss_type = 'l1'    # L1 or L2
+    timesteps = 1000    # number of steps
 )
 
 training_images = torch.rand(8, 3, 128, 128) # images are normalized from 0 to 1
 loss = diffusion(training_images)
 loss.backward()
+
 # after a lot of training
 
 sampled_images = diffusion.sample(batch_size = 4)
@@ -58,15 +59,15 @@ from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
 
 model = Unet(
     dim = 64,
-    dim_mults = (1, 2, 4, 8)
+    dim_mults = (1, 2, 4, 8),
+    flash_attn = True
 )
 
 diffusion = GaussianDiffusion(
     model,
     image_size = 128,
     timesteps = 1000,           # number of steps
-    sampling_timesteps = 250,   # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
-    loss_type = 'l1'            # L1 or L2
+    sampling_timesteps = 250    # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 )
 
 trainer = Trainer(
@@ -106,11 +107,11 @@ $ accelerate launch train.py
 
 ### 1D Sequence
 
-By popular request, a 1D Unet + Gaussian Diffusion implementation. You will have to do the training code yourself
+By popular request, a 1D Unet + Gaussian Diffusion implementation.
 
 ```python
 import torch
-from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D
+from denoising_diffusion_pytorch import Unet1D, GaussianDiffusion1D, Trainer1D, Dataset1D
 
 model = Unet1D(
     dim = 64,
@@ -125,15 +126,37 @@ diffusion = GaussianDiffusion1D(
     objective = 'pred_v'
 )
 
-training_seq = torch.rand(8, 32, 128) # features are normalized from 0 to 1
+training_seq = torch.rand(64, 32, 128) # features are normalized from 0 to 1
+dataset = Dataset1D(training_seq)  # this is just an example, but you can formulate your own Dataset and pass it into the `Trainer1D` below
+
 loss = diffusion(training_seq)
 loss.backward()
+
+# Or using trainer
+
+trainer = Trainer1D(
+    diffusion,
+    dataset = dataset,
+    train_batch_size = 32,
+    train_lr = 8e-5,
+    train_num_steps = 700000,         # total training steps
+    gradient_accumulate_every = 2,    # gradient accumulation steps
+    ema_decay = 0.995,                # exponential moving average decay
+    amp = True,                       # turn on mixed precision
+)
+trainer.train()
 
 # after a lot of training
 
 sampled_seq = diffusion.sample(batch_size = 4)
 sampled_seq.shape # (4, 32, 128)
+
 ```
+
+`Trainer1D` does not evaluate the generated samples in any way since the type of data is not known.
+
+You could consider adding a suitable metric to the training loop yourself after doing an editable install of this package
+`pip install -e .`.
 
 ## Citations
 
@@ -211,16 +234,6 @@ sampled_seq.shape # (4, 32, 128)
 ```
 
 ```bibtex
-@article{Qiao2019WeightS,
-    title   = {Weight Standardization},
-    author  = {Siyuan Qiao and Huiyu Wang and Chenxi Liu and Wei Shen and Alan Loddon Yuille},
-    journal = {ArXiv},
-    year    = {2019},
-    volume  = {abs/1903.10520}
-}
-```
-
-```bibtex
 @article{Salimans2022ProgressiveDF,
     title   = {Progressive Distillation for Fast Sampling of Diffusion Models},
     author  = {Tim Salimans and Jonathan Ho},
@@ -293,5 +306,29 @@ sampled_seq.shape # (4, 32, 128)
     title   = {Efficient Diffusion Training via Min-SNR Weighting Strategy},
     author  = {Tiankai Hang and Shuyang Gu and Chen Li and Jianmin Bao and Dong Chen and Han Hu and Xin Geng and Baining Guo},
     year    = {2023}
+}
+```
+
+```bibtex
+@misc{Guttenberg2023,
+    author  = {Nicholas Guttenberg},
+    url     = {https://www.crosslabs.org/blog/diffusion-with-offset-noise}
+}
+```
+
+```bibtex
+@inproceedings{Lin2023CommonDN,
+    title   = {Common Diffusion Noise Schedules and Sample Steps are Flawed},
+    author  = {Shanchuan Lin and Bingchen Liu and Jiashi Li and Xiao Yang},
+    year    = {2023}
+}
+```
+
+```bibtex
+@inproceedings{dao2022flashattention,
+    title   = {Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+    author  = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2022}
 }
 ```

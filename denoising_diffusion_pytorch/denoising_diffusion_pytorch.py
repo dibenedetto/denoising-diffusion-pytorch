@@ -8,6 +8,7 @@ from multiprocessing import cpu_count
 
 import torch
 from torch import nn, einsum
+from torch.cuda.amp import autocast
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
@@ -24,8 +25,8 @@ from ema_pytorch import EMA
 
 from accelerate import Accelerator
 
-from pytorch_fid.inception import InceptionV3
-from pytorch_fid.fid_score import calculate_frechet_distance
+from denoising_diffusion_pytorch.attend import Attend
+from denoising_diffusion_pytorch.fid_evaluation import FIDEvaluation
 
 from denoising_diffusion_pytorch.version import __version__
 
@@ -42,6 +43,14 @@ def default(val, d):
     if exists(val):
         return val
     return d() if callable(d) else d
+
+def cast_tuple(t, length = 1):
+    if isinstance(t, tuple):
+        return t
+    return ((t,) * length)
+
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
 
 def identity(t, *args, **kwargs):
     return t
@@ -77,14 +86,6 @@ def unnormalize_to_zero_to_one(t):
 
 # small helper modules
 
-class Residual(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, x, *args, **kwargs):
-        return self.fn(x, *args, **kwargs) + x
-
 def Upsample(dim, dim_out = None):
     return nn.Sequential(
         nn.Upsample(scale_factor = 2, mode = 'nearest'),
@@ -97,53 +98,26 @@ def Downsample(dim, dim_out = None):
         nn.Conv2d(dim * 4, default(dim_out, dim), 1)
     )
 
-class WeightStandardizedConv2d(nn.Conv2d):
-    """
-    https://arxiv.org/abs/1903.10520
-    weight standardization purportedly works synergistically with group normalization
-    """
-    def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-
-        weight = self.weight
-        mean = reduce(weight, 'o ... -> o 1 1 1', 'mean')
-        var = reduce(weight, 'o ... -> o 1 1 1', partial(torch.var, unbiased = False))
-        normalized_weight = (weight - mean) * (var + eps).rsqrt()
-
-        return F.conv2d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
-class LayerNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
 
     def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) * (var + eps).rsqrt() * self.g
-
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
-        super().__init__()
-        self.fn = fn
-        self.norm = LayerNorm(dim)
-
-    def forward(self, x):
-        x = self.norm(x)
-        return self.fn(x)
+        return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
 
 # sinusoidal positional embeds
 
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, theta = 10000):
         super().__init__()
         self.dim = dim
+        self.theta = theta
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
@@ -155,7 +129,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 
     def __init__(self, dim, is_random = False):
         super().__init__()
-        assert (dim % 2) == 0
+        assert divisible_by(dim, 2)
         half_dim = dim // 2
         self.weights = nn.Parameter(torch.randn(half_dim), requires_grad = not is_random)
 
@@ -171,7 +145,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
-        self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding = 1)
+        self.proj = nn.Conv2d(dim, dim_out, 3, padding = 1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -213,20 +187,30 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 class LinearAttention(nn.Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
+    def __init__(
+        self,
+        dim,
+        heads = 4,
+        dim_head = 32
+    ):
         super().__init__()
         self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
+
+        self.norm = RMSNorm(dim)
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
 
         self.to_out = nn.Sequential(
             nn.Conv2d(hidden_dim, dim, 1),
-            LayerNorm(dim)
+            RMSNorm(dim)
         )
 
     def forward(self, x):
         b, c, h, w = x.shape
+
+        x = self.norm(x)
+
         qkv = self.to_qkv(x).chunk(3, dim = 1)
         q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
 
@@ -234,7 +218,6 @@ class LinearAttention(nn.Module):
         k = k.softmax(dim = -1)
 
         q = q * self.scale
-        v = v / (h * w)
 
         context = torch.einsum('b h d n, b h e n -> b h d e', k, v)
 
@@ -243,25 +226,32 @@ class LinearAttention(nn.Module):
         return self.to_out(out)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads = 4, dim_head = 32):
+    def __init__(
+        self,
+        dim,
+        heads = 4,
+        dim_head = 32,
+        flash = False
+    ):
         super().__init__()
-        self.scale = dim_head ** -0.5
         self.heads = heads
         hidden_dim = dim_head * heads
+
+        self.norm = RMSNorm(dim)
+        self.attend = Attend(flash = flash)
 
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
+
+        x = self.norm(x)
+
         qkv = self.to_qkv(x).chunk(3, dim = 1)
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h (x y) c', h = self.heads), qkv)
 
-        q = q * self.scale
-
-        sim = einsum('b h d i, b h d j -> b h i j', q, k)
-        attn = sim.softmax(dim = -1)
-        out = einsum('b h i j, b h d j -> b h i d', attn, v)
+        out = self.attend(q, k, v)
 
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
@@ -274,14 +264,19 @@ class Unet(nn.Module):
         dim,
         init_dim = None,
         out_dim = None,
-        dim_mults=(1, 2, 4, 8),
+        dim_mults = (1, 2, 4, 8),
         channels = 3,
         self_condition = False,
         resnet_block_groups = 8,
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
-        learned_sinusoidal_dim = 16
+        learned_sinusoidal_dim = 16,
+        sinusoidal_pos_emb_theta = 10000,
+        attn_dim_head = 32,
+        attn_heads = 4,
+        full_attn = (False, False, False, True),
+        flash_attn = False
     ):
         super().__init__()
 
@@ -309,7 +304,7 @@ class Unet(nn.Module):
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
             fourier_dim = learned_sinusoidal_dim + 1
         else:
-            sinu_pos_emb = SinusoidalPosEmb(dim)
+            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
             fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
@@ -319,34 +314,49 @@ class Unet(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
+        # attention
+
+        num_stages = len(dim_mults)
+        full_attn  = cast_tuple(full_attn, num_stages)
+        attn_heads = cast_tuple(attn_heads, num_stages)
+        attn_dim_head = cast_tuple(attn_dim_head, num_stages)
+
+        assert len(full_attn) == len(dim_mults)
+
+        FullAttention = partial(Attention, flash = flash_attn)
+
         # layers
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
 
-        for ind, (dim_in, dim_out) in enumerate(in_out):
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
             is_last = ind >= (num_resolutions - 1)
+
+            attn_klass = FullAttention if layer_full_attn else LinearAttention
 
             self.downs.append(nn.ModuleList([
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
                 block_klass(dim_in, dim_in, time_emb_dim = time_dim),
-                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_attn = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
 
-        for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
             is_last = ind == (len(in_out) - 1)
+
+            attn_klass = FullAttention if layer_full_attn else LinearAttention
 
             self.ups.append(nn.ModuleList([
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
 
@@ -356,7 +366,13 @@ class Unet(nn.Module):
         self.final_res_block = block_klass(init_dim * 2, dim, time_emb_dim = time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
+    @property
+    def downsample_factor(self):
+        return 2 ** (len(self.downs) - 1)
+
     def forward(self, x, time, x_self_cond = None):
+        assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
+
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -373,13 +389,13 @@ class Unet(nn.Module):
             h.append(x)
 
             x = block2(x, t)
-            x = attn(x)
+            x = attn(x) + x
             h.append(x)
 
             x = downsample(x)
 
         x = self.mid_block1(x, t)
-        x = self.mid_attn(x)
+        x = self.mid_attn(x) + x
         x = self.mid_block2(x, t)
 
         for block1, block2, attn, upsample in self.ups:
@@ -388,7 +404,7 @@ class Unet(nn.Module):
 
             x = torch.cat((x, h.pop()), dim = 1)
             x = block2(x, t)
-            x = attn(x)
+            x = attn(x) + x
 
             x = upsample(x)
 
@@ -448,12 +464,12 @@ class GaussianDiffusion(nn.Module):
         image_size,
         timesteps = 1000,
         sampling_timesteps = None,
-        loss_type = 'l1',
-        objective = 'pred_noise',
+        objective = 'pred_v',
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
         auto_normalize = True,
+        offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5
     ):
@@ -489,7 +505,6 @@ class GaussianDiffusion(nn.Module):
 
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
-        self.loss_type = loss_type
 
         # sampling related parameters
 
@@ -529,6 +544,10 @@ class GaussianDiffusion(nn.Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
+        # offset noise strength - in blogpost, they claimed 0.1 was ideal
+
+        self.offset_noise_strength = offset_noise_strength
+
         # derive loss weight
         # snr - signal noise ratio
 
@@ -551,6 +570,10 @@ class GaussianDiffusion(nn.Module):
 
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+
+    @property
+    def device(self):
+        return self.betas.device
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -620,18 +643,18 @@ class GaussianDiffusion(nn.Module):
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def p_sample(self, x, t: int, x_self_cond = None):
-        b, *_, device = *x.shape, x.device
-        batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
+        b, *_, device = *x.shape, self.device
+        batched_times = torch.full((b,), t, device = device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def p_sample_loop(self, shape, return_all_timesteps = False):
-        batch, device = shape[0], self.betas.device
+        batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
         imgs = [img]
@@ -648,9 +671,9 @@ class GaussianDiffusion(nn.Module):
         ret = self.unnormalize(ret)
         return ret
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def ddim_sample(self, shape, return_all_timesteps = False):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
@@ -690,13 +713,13 @@ class GaussianDiffusion(nn.Module):
         ret = self.unnormalize(ret)
         return ret
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
@@ -716,7 +739,8 @@ class GaussianDiffusion(nn.Module):
 
         return img
 
-    def q_sample(self, x_start, t, noise=None):
+    @autocast(enabled = False)
+    def q_sample(self, x_start, t, noise = None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         return (
@@ -724,18 +748,18 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    @property
-    def loss_fn(self):
-        if self.loss_type == 'l1':
-            return F.l1_loss
-        elif self.loss_type == 'l2':
-            return F.mse_loss
-        else:
-            raise ValueError(f'invalid loss type {self.loss_type}')
-
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
+
         noise = default(noise, lambda: torch.randn_like(x_start))
+
+        # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
+
+        offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
+
+        if offset_noise_strength > 0.:
+            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
+            noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
 
         # noise sample
 
@@ -747,7 +771,7 @@ class GaussianDiffusion(nn.Module):
 
         x_self_cond = None
         if self.self_condition and random() < 0.5:
-            with torch.no_grad():
+            with torch.inference_mode():
                 x_self_cond = self.model_predictions(x, t).pred_x_start
                 x_self_cond.detach_()
 
@@ -765,8 +789,8 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        loss = F.mse_loss(model_out, target, reduction = 'none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
@@ -833,11 +857,14 @@ class Trainer(object):
         num_samples = 25,
         results_folder = './results',
         amp = False,
-        fp16 = False,
+        mixed_precision_type = 'fp16',
         split_batches = True,
         convert_image_to = None,
         calculate_fid = True,
-        inception_block_idx = 2048
+        inception_block_idx = 2048,
+        max_grad_norm = 1.,
+        num_fid_samples = 50000,
+        save_best_and_latest_only = False
     ):
         super().__init__()
 
@@ -845,25 +872,14 @@ class Trainer(object):
 
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = 'fp16' if fp16 else 'no'
+            mixed_precision = mixed_precision_type if amp else 'no'
         )
-
-        self.accelerator.native_amp = amp
 
         # model
 
         self.model = diffusion_model
         self.channels = diffusion_model.channels
-
-        # InceptionV3 for fid-score computation
-
-        self.inception_v3 = None
-
-        if calculate_fid:
-            assert inception_block_idx in InceptionV3.BLOCK_INDEX_BY_DIM
-            block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
-            self.inception_v3 = InceptionV3([block_idx])
-            self.inception_v3.to(self.device)
+        is_ddim_sampling = diffusion_model.is_ddim_sampling
 
         # sampling and training hyperparameters
 
@@ -873,13 +889,19 @@ class Trainer(object):
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
+        assert (train_batch_size * gradient_accumulate_every) >= 16, f'your effective batch size (train_batch_size x gradient_accumulate_every) should be at least 16 or above'
 
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
 
+        self.max_grad_norm = max_grad_norm
+
         # dataset and dataloader
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+
+        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)
@@ -905,6 +927,34 @@ class Trainer(object):
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        # FID-score computation
+
+        self.calculate_fid = calculate_fid and self.accelerator.is_main_process
+
+        if self.calculate_fid:
+            if not is_ddim_sampling:
+                self.accelerator.print(
+                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
+                    "Consider using DDIM sampling to save time."
+                )
+            self.fid_scorer = FIDEvaluation(
+                batch_size=self.batch_size,
+                dl=self.dl,
+                sampler=self.ema.ema_model,
+                channels=self.channels,
+                accelerator=self.accelerator,
+                stats_dir=results_folder,
+                device=self.device,
+                num_fid_samples=num_fid_samples,
+                inception_block_idx=inception_block_idx
+            )
+
+        if save_best_and_latest_only:
+            assert calculate_fid, "`calculate_fid` must be True to provide a means for model evaluation for `save_best_and_latest_only`."
+            self.best_fid = 1e10 # infinite
+
+        self.save_best_and_latest_only = save_best_and_latest_only
 
     @property
     def device(self):
@@ -945,31 +995,6 @@ class Trainer(object):
         if exists(self.accelerator.scaler) and exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
 
-    @torch.no_grad()
-    def calculate_activation_statistics(self, samples):
-        assert exists(self.inception_v3)
-
-        features = self.inception_v3(samples)[0]
-        features = rearrange(features, '... 1 1 -> ...')
-
-        mu = torch.mean(features, dim = 0).cpu()
-        sigma = torch.cov(features).cpu()
-        return mu, sigma
-
-    def fid_score(self, real_samples, fake_samples):
-
-        if self.channels == 1:
-            real_samples, fake_samples = map(lambda t: repeat(t, 'b 1 ... -> b c ...', c = 3), (real_samples, fake_samples))
-
-        min_batch = min(real_samples.shape[0], fake_samples.shape[0])
-        real_samples, fake_samples = map(lambda t: t[:min_batch], (real_samples, fake_samples))
-
-        m1, s1 = self.calculate_activation_statistics(real_samples)
-        m2, s2 = self.calculate_activation_statistics(fake_samples)
-
-        fid_value = calculate_frechet_distance(m1, s1, m2, s2)
-        return fid_value
-
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
@@ -990,10 +1015,10 @@ class Trainer(object):
 
                     self.accelerator.backward(loss)
 
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
                 accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                 self.opt.step()
                 self.opt.zero_grad()
@@ -1004,10 +1029,10 @@ class Trainer(object):
                 if accelerator.is_main_process:
                     self.ema.update()
 
-                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
 
-                        with torch.no_grad():
+                        with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
@@ -1015,13 +1040,19 @@ class Trainer(object):
                         all_images = torch.cat(all_images_list, dim = 0)
 
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
-                        self.save(milestone)
 
                         # whether to calculate fid
 
-                        if exists(self.inception_v3):
-                            fid_score = self.fid_score(real_samples = data, fake_samples = all_images)
+                        if self.calculate_fid:
+                            fid_score = self.fid_scorer.fid_score()
                             accelerator.print(f'fid_score: {fid_score}')
+                        if self.save_best_and_latest_only:
+                            if self.best_fid > fid_score:
+                                self.best_fid = fid_score
+                                self.save("best")
+                            self.save("latest")
+                        else:
+                            self.save(milestone)
 
                 pbar.update(1)
 

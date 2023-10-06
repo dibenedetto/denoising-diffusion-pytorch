@@ -1,16 +1,26 @@
 import math
+from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
+from multiprocessing import cpu_count
 
 import torch
-from torch import nn, einsum
+from torch import nn, einsum, Tensor
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
+from torch.optim import Adam
+from torch.utils.data import Dataset, DataLoader
 
 from einops import rearrange, reduce
 from einops.layers.torch import Rearrange
 
+from accelerate import Accelerator
+from ema_pytorch import EMA
+
 from tqdm.auto import tqdm
+
+from denoising_diffusion_pytorch.version import __version__
 
 # constants
 
@@ -58,6 +68,19 @@ def normalize_to_neg_one_to_one(img):
 def unnormalize_to_zero_to_one(t):
     return (t + 1) * 0.5
 
+# data
+
+class Dataset1D(Dataset):
+    def __init__(self, tensor: Tensor):
+        super().__init__()
+        self.tensor = tensor.clone()
+
+    def __len__(self):
+        return len(self.tensor)
+
+    def __getitem__(self, idx):
+        return self.tensor[idx].clone()
+
 # small helper modules
 
 class Residual(nn.Module):
@@ -77,37 +100,19 @@ def Upsample(dim, dim_out = None):
 def Downsample(dim, dim_out = None):
     return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
 
-class WeightStandardizedConv2d(nn.Conv1d):
-    """
-    https://arxiv.org/abs/1903.10520
-    weight standardization purportedly works synergistically with group normalization
-    """
-    def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-
-        weight = self.weight
-        mean = reduce(weight, 'o ... -> o 1 1', 'mean')
-        var = reduce(weight, 'o ... -> o 1 1', partial(torch.var, unbiased = False))
-        normalized_weight = (weight - mean) * (var + eps).rsqrt()
-
-        return F.conv1d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
-class LayerNorm(nn.Module):
+class RMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.g = nn.Parameter(torch.ones(1, dim, 1))
 
     def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) * (var + eps).rsqrt() * self.g
+        return F.normalize(x, dim = 1) * self.g * (x.shape[1] ** 0.5)
 
 class PreNorm(nn.Module):
     def __init__(self, dim, fn):
         super().__init__()
         self.fn = fn
-        self.norm = LayerNorm(dim)
+        self.norm = RMSNorm(dim)
 
     def forward(self, x):
         x = self.norm(x)
@@ -116,14 +121,15 @@ class PreNorm(nn.Module):
 # sinusoidal positional embeds
 
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, theta = 10000):
         super().__init__()
         self.dim = dim
+        self.theta = theta
 
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
+        emb = math.log(self.theta) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
@@ -151,7 +157,7 @@ class RandomOrLearnedSinusoidalPosEmb(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups = 8):
         super().__init__()
-        self.proj = WeightStandardizedConv2d(dim, dim_out, 3, padding = 1)
+        self.proj = nn.Conv1d(dim, dim_out, 3, padding = 1)
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -202,7 +208,7 @@ class LinearAttention(nn.Module):
 
         self.to_out = nn.Sequential(
             nn.Conv1d(hidden_dim, dim, 1),
-            LayerNorm(dim)
+            RMSNorm(dim)
         )
 
     def forward(self, x):
@@ -260,7 +266,10 @@ class Unet1D(nn.Module):
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
-        learned_sinusoidal_dim = 16
+        learned_sinusoidal_dim = 16,
+        sinusoidal_pos_emb_theta = 10000,
+        attn_dim_head = 32,
+        attn_heads = 4
     ):
         super().__init__()
 
@@ -288,7 +297,7 @@ class Unet1D(nn.Module):
             sinu_pos_emb = RandomOrLearnedSinusoidalPosEmb(learned_sinusoidal_dim, random_fourier_features)
             fourier_dim = learned_sinusoidal_dim + 1
         else:
-            sinu_pos_emb = SinusoidalPosEmb(dim)
+            sinu_pos_emb = SinusoidalPosEmb(dim, theta = sinusoidal_pos_emb_theta)
             fourier_dim = dim
 
         self.time_mlp = nn.Sequential(
@@ -316,7 +325,7 @@ class Unet1D(nn.Module):
 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
-        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim, dim_head = attn_dim_head, heads = attn_heads)))
         self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
@@ -409,7 +418,6 @@ class GaussianDiffusion1D(nn.Module):
         seq_length,
         timesteps = 1000,
         sampling_timesteps = None,
-        loss_type = 'l1',
         objective = 'pred_noise',
         beta_schedule = 'cosine',
         ddim_sampling_eta = 0.,
@@ -439,7 +447,6 @@ class GaussianDiffusion1D(nn.Module):
 
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
-        self.loss_type = loss_type
 
         # sampling related parameters
 
@@ -651,6 +658,7 @@ class GaussianDiffusion1D(nn.Module):
 
         return img
 
+    @autocast(enabled = False)
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -658,15 +666,6 @@ class GaussianDiffusion1D(nn.Module):
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
-
-    @property
-    def loss_fn(self):
-        if self.loss_type == 'l1':
-            return F.l1_loss
-        elif self.loss_type == 'l2':
-            return F.mse_loss
-        else:
-            raise ValueError(f'invalid loss type {self.loss_type}')
 
     def p_losses(self, x_start, t, noise = None):
         b, c, n = x_start.shape
@@ -700,8 +699,8 @@ class GaussianDiffusion1D(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
-        loss = self.loss_fn(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        loss = F.mse_loss(model_out, target, reduction = 'none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
@@ -713,3 +712,170 @@ class GaussianDiffusion1D(nn.Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
+
+# trainer class
+
+class Trainer1D(object):
+    def __init__(
+        self,
+        diffusion_model: GaussianDiffusion1D,
+        dataset: Dataset,
+        *,
+        train_batch_size = 16,
+        gradient_accumulate_every = 1,
+        train_lr = 1e-4,
+        train_num_steps = 100000,
+        ema_update_every = 10,
+        ema_decay = 0.995,
+        adam_betas = (0.9, 0.99),
+        save_and_sample_every = 1000,
+        num_samples = 25,
+        results_folder = './results',
+        amp = False,
+        mixed_precision_type = 'fp16',
+        split_batches = True,
+        max_grad_norm = 1.
+    ):
+        super().__init__()
+
+        # accelerator
+
+        self.accelerator = Accelerator(
+            split_batches = split_batches,
+            mixed_precision = mixed_precision_type if amp else 'no'
+        )
+
+        # model
+
+        self.model = diffusion_model
+        self.channels = diffusion_model.channels
+
+        # sampling and training hyperparameters
+
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.max_grad_norm = max_grad_norm
+
+        self.train_num_steps = train_num_steps
+
+        # dataset and dataloader
+
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        # optimizer
+
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'version': __version__
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl).to(device)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'loss: {total_loss:.4f}')
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            milestone = self.step // self.save_and_sample_every
+                            batches = num_to_groups(self.num_samples, self.batch_size)
+                            all_samples_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+
+                        all_samples = torch.cat(all_samples_list, dim = 0)
+
+                        torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        self.save(milestone)
+
+                pbar.update(1)
+
+        accelerator.print('training complete')
